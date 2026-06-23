@@ -10,6 +10,7 @@
 <meta name="apple-mobile-web-app-title" content="Elite Kitchens">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <title>Elite Kitchens — Callouts</title>
 <style>
   :root{
@@ -125,6 +126,11 @@
   .seg .opt{flex:1;min-width:64px;text-align:center;font-family:-apple-system,system-ui,sans-serif;font-size:13px;padding:9px 4px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer;color:var(--grain)}
   .seg .opt.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
   .hint{font-family:-apple-system,system-ui,sans-serif;font-size:12px;color:var(--grain);margin-bottom:10px;line-height:1.5}
+  .syncbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 13px;margin-top:14px;font-family:-apple-system,system-ui,sans-serif;font-size:13px}
+  .syncbar .sync-on{color:var(--won);font-weight:600}
+  .syncbar .sync-off{color:var(--grain)}
+  .syncbar .sync-btn{margin-left:auto;font-family:-apple-system,system-ui,sans-serif;font-size:13px;padding:7px 13px;border-radius:8px;border:1px solid var(--brass-soft);background:#efe9dc;color:var(--brass);cursor:pointer;font-weight:600}
+  .syncbar .sync-btn.prime{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 </style>
 </head>
 <body>
@@ -145,6 +151,7 @@
 
   <!-- CALENDAR -->
   <div id="calPage">
+    <div id="syncBar" class="syncbar"></div>
     <div class="cal-shell">
       <div class="cal-top">
         <button class="cal-nav prev" onclick="moveMonth(-1)">‹</button>
@@ -186,6 +193,7 @@ let view_="dash";
 let calMonth=new Date().getMonth();
 let calYear=new Date().getFullYear();
 let selDay=ymd(new Date());
+let tokenClient=null,accessToken=null,tokenExpiry=0,gcalConnected=false;
 
 function loadLeads(){
   try{const raw=localStorage.getItem('ek_callouts');if(raw)return JSON.parse(raw);}catch(e){}
@@ -504,14 +512,136 @@ function save(){
     if(callout){selDay=ymdOf(callout);calMonth=new Date(callout).getMonth();calYear=new Date(callout).getFullYear();calendarChanged=true;}
   }
   saveLeads();closeSheet();render();
-  if(calendarChanged&&savedLead&&savedLead.callout)icsDownload(savedLead);
+  if(gcalConnected){
+    if(savedLead&&savedLead.callout){(savedLead.gcalId?gcalUpdate:gcalCreate)(savedLead).catch(function(e){console.warn("gcal",e);});}
+    else if(savedLead&&savedLead.gcalId){gcalDelete(savedLead).catch(function(e){console.warn("gcal",e);});}
+  }else if(calendarChanged&&savedLead&&savedLead.callout){icsDownload(savedLead);}
 }
-function del(){if(editing)leads=leads.filter(l=>l.id!==editing);saveLeads();closeSheet();render();}
+function del(){
+  if(editing){
+    const l=leads.find(x=>x.id===editing);
+    if(l&&gcalConnected&&l.gcalId){gcalDelete(l).catch(function(e){console.warn("gcal",e);});}
+    leads=leads.filter(x=>x.id!==editing);
+  }
+  saveLeads();closeSheet();render();
+}
 function closeSheet(){document.getElementById("ov").classList.remove("show");editing=null;}
 document.getElementById("ov").addEventListener("click",e=>{if(e.target.id==="ov")closeSheet();});
 function esc(s){return(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
+/* ---------- Google Calendar two-way sync ---------- */
+const GCAL_CLIENT_ID="657103728834-5gbg8jjej8ue7a5trbmdec25hfuh6miv.apps.googleusercontent.com";
+const GCAL_SCOPE="https://www.googleapis.com/auth/calendar.events";
+const TZ="Europe/Dublin";
+function getToken(interactive){
+  return new Promise(function(resolve,reject){
+    if(accessToken&&Date.now()<tokenExpiry-60000){resolve(accessToken);return;}
+    if(!tokenClient){reject(new Error("Google not ready"));return;}
+    tokenClient.callback=function(resp){
+      if(resp&&resp.error){reject(resp);return;}
+      accessToken=resp.access_token;
+      tokenExpiry=Date.now()+((resp.expires_in||3600)*1000);
+      resolve(accessToken);
+    };
+    try{tokenClient.requestAccessToken({prompt:interactive?"consent":""});}
+    catch(e){reject(e);}
+  });
+}
+async function gfetch(method,path,body){
+  const token=await getToken(false);
+  const opt={method:method,headers:{Authorization:"Bearer "+token}};
+  if(body){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body);}
+  const res=await fetch("https://www.googleapis.com/calendar/v3"+path,opt);
+  if(res.status===204)return {};
+  const data=await res.json().catch(function(){return {};});
+  if(!res.ok)throw data;
+  return data;
+}
+function eventBody(l){
+  const start=new Date(l.callout);
+  const end=new Date(start.getTime()+60*60000);
+  const desc=[l.job?("Job: "+l.job):"",l.phone?("Phone: "+l.phone):"",l.email||"",l.value?("Quote: €"+l.value):"",l.note||""].filter(Boolean).join("\n");
+  return {
+    summary:"Callout — "+l.name+(l.area?" ("+l.area+")":""),
+    location:[l.address,l.area].filter(Boolean).join(", "),
+    description:desc,
+    start:{dateTime:start.toISOString(),timeZone:TZ},
+    end:{dateTime:end.toISOString(),timeZone:TZ},
+    extendedProperties:{private:{ekApp:"1",ekLeadId:String(l.id)}}
+  };
+}
+async function gcalCreate(l){
+  const r=await gfetch("POST","/calendars/primary/events",eventBody(l));
+  if(r&&r.id){l.gcalId=r.id;saveLeads();}
+}
+async function gcalUpdate(l){
+  if(!l.gcalId){return gcalCreate(l);}
+  await gfetch("PATCH","/calendars/primary/events/"+encodeURIComponent(l.gcalId),eventBody(l));
+}
+async function gcalDelete(l){
+  if(!l.gcalId)return;
+  try{await gfetch("DELETE","/calendars/primary/events/"+encodeURIComponent(l.gcalId),null);}catch(e){}
+  l.gcalId=null;saveLeads();
+}
+async function gcalPull(){
+  const timeMin=new Date(Date.now()-30*86400000).toISOString();
+  const timeMax=new Date(Date.now()+365*86400000).toISOString();
+  const q="/calendars/primary/events?singleEvents=true&maxResults=2500&privateExtendedProperty="+encodeURIComponent("ekApp=1")+"&timeMin="+encodeURIComponent(timeMin)+"&timeMax="+encodeURIComponent(timeMax);
+  const data=await gfetch("GET",q,null);
+  const items=data.items||[];
+  const byId={};
+  items.forEach(function(e){var pr=e.extendedProperties&&e.extendedProperties.private;if(pr&&pr.ekLeadId)byId[pr.ekLeadId]=e;});
+  let changed=false;
+  leads.forEach(function(l){
+    if(!l.gcalId)return;
+    const e=byId[String(l.id)];
+    if(!e||e.status==="cancelled"){
+      if(l.callout){l.callout=null;if(l.stage==="Booked")l.stage="New";}
+      l.gcalId=null;changed=true;
+    }else if(e.start&&e.start.dateTime){
+      const newIso=new Date(e.start.dateTime).toISOString();
+      if(!l.callout||newIso!==new Date(l.callout).toISOString()){l.callout=newIso;changed=true;}
+    }
+  });
+  if(changed){saveLeads();render();}
+}
+async function gcalSyncAll(){
+  for(var i=0;i<leads.length;i++){var l=leads[i];if(l.callout&&!l.gcalId){try{await gcalCreate(l);}catch(e){}}}
+  await gcalPull();
+}
+async function connectCalendar(){
+  try{
+    await getToken(true);
+    gcalConnected=true;
+    try{localStorage.setItem("ek_gcal","1");}catch(e){}
+    updateSyncUI("Syncing…");
+    await gcalSyncAll();
+    updateSyncUI();
+    render();
+  }catch(e){updateSyncUI();alert("Couldn't connect to Google Calendar. Please try again.");}
+}
+function manualSync(){updateSyncUI("Syncing…");gcalPull().then(function(){updateSyncUI();}).catch(function(){updateSyncUI();});}
+function disconnectCalendar(){gcalConnected=false;accessToken=null;tokenExpiry=0;try{localStorage.removeItem("ek_gcal");}catch(e){}updateSyncUI();}
+function updateSyncUI(msg){
+  const el=document.getElementById("syncBar");if(!el)return;
+  if(gcalConnected){
+    el.innerHTML='<span class="sync-on">● Calendar connected</span><button class="sync-btn" onclick="manualSync()">'+(msg||"Refresh")+'</button>';
+  }else{
+    el.innerHTML='<span class="sync-off">Calendar not connected</span><button class="sync-btn prime" onclick="connectCalendar()">Connect Google Calendar</button>';
+  }
+}
+function initGcal(){
+  if(typeof google==="undefined"||!google.accounts||!google.accounts.oauth2){setTimeout(initGcal,300);return;}
+  tokenClient=google.accounts.oauth2.initTokenClient({client_id:GCAL_CLIENT_ID,scope:GCAL_SCOPE,callback:function(){}});
+  if(localStorage.getItem("ek_gcal")==="1"){
+    gcalConnected=true;
+    getToken(false).then(function(){return gcalPull();}).catch(function(){});
+  }
+  updateSyncUI();
+}
+
 go("dash");
+initGcal();
 </script>
 <script>if("serviceWorker" in navigator){window.addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){});});}</script>
 </body>
